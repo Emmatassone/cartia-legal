@@ -1,0 +1,111 @@
+name: Deploy RAG to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rag/**"
+      - "shared/**"
+      - ".github/workflows/deploy-rag.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-rag
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'southamerica-east1' }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY || 'cartia-containers' }}
+  SERVICE_NAME: ${{ vars.RAG_SERVICE_NAME || 'cartia-rag' }}
+  RUNTIME_SERVICE_ACCOUNT: ${{ vars.RAG_RUNTIME_SERVICE_ACCOUNT }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push container
+        env:
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+        run: |
+          docker build -f rag/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Validate required secrets and vars
+        env:
+          RAG_DATABASE_URL: ${{ secrets.RAG_DATABASE_URL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          INTERNAL_TOKEN: ${{ secrets.INTERNAL_TOKEN }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS }}
+        run: |
+          missing=()
+          [[ -z "$RAG_DATABASE_URL" ]] && missing+=("secret:RAG_DATABASE_URL")
+          [[ -z "$GOOGLE_API_KEY" ]] && missing+=("secret:GOOGLE_API_KEY")
+          [[ -z "$INTERNAL_TOKEN" ]] && missing+=("secret:INTERNAL_TOKEN")
+          [[ -z "$EMBEDDING_DIMENSIONS" ]] && missing+=("var:EMBEDDING_DIMENSIONS")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required GitHub config: ${missing[*]}"
+            exit 1
+          fi
+
+      # `--no-allow-unauthenticated`: el servicio RAG solo lo consume el backend, nunca el
+      # browser. Ademas valida el header X-Internal-Token, asi que hay dos capas.
+      # `--min-instances=1` evita el cold start en el hot path de cada consulta.
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE }}
+          flags: >
+            --no-allow-unauthenticated
+            --port=8002
+            --cpu=1
+            --memory=1Gi
+            --min-instances=1
+            --max-instances=10
+            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
+          env_vars: |
+            DATABASE_URL=${{ secrets.RAG_DATABASE_URL }}
+            GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}
+            INTERNAL_TOKEN=${{ secrets.INTERNAL_TOKEN }}
+            EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'gemini-embedding-001' }}
+            EMBEDDING_DIMENSIONS=${{ vars.EMBEDDING_DIMENSIONS }}
+            CANDIDATE_POOL=${{ vars.CANDIDATE_POOL || '40' }}
+            RRF_K=${{ vars.RRF_K || '60' }}
+            LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}
+
+      - name: Allow the backend service account to invoke this service
+        run: |
+          gcloud run services add-iam-policy-binding "${{ env.SERVICE_NAME }}" \
+            --region="${{ env.REGION }}" \
+            --member="serviceAccount:${{ vars.BACKEND_RUNTIME_SERVICE_ACCOUNT }}" \
+            --role="roles/run.invoker" \
+            --quiet
+
+      - name: Show deployed URL
+        run: |
+          echo "RAG URL: ${{ steps.deploy.outputs.url }}"

@@ -1,0 +1,127 @@
+name: Deploy Backend to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "shared/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'southamerica-east1' }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY || 'cartia-containers' }}
+  SERVICE_NAME: ${{ vars.BACKEND_SERVICE_NAME || 'cartia-backend' }}
+  RUNTIME_SERVICE_ACCOUNT: ${{ vars.BACKEND_RUNTIME_SERVICE_ACCOUNT }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push container
+        env:
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+        run: |
+          docker build -f backend/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Validate required secrets and vars
+        env:
+          BACKEND_DATABASE_URL: ${{ secrets.BACKEND_DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          INTERNAL_TOKEN: ${{ secrets.INTERNAL_TOKEN }}
+          RAG_SERVICE_URL: ${{ vars.RAG_SERVICE_URL }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+        run: |
+          missing=()
+          [[ -z "$BACKEND_DATABASE_URL" ]] && missing+=("secret:BACKEND_DATABASE_URL")
+          [[ -z "$JWT_SECRET" ]] && missing+=("secret:JWT_SECRET")
+          [[ -z "$GOOGLE_API_KEY" ]] && missing+=("secret:GOOGLE_API_KEY")
+          [[ -z "$INTERNAL_TOKEN" ]] && missing+=("secret:INTERNAL_TOKEN")
+          [[ -z "$RAG_SERVICE_URL" ]] && missing+=("var:RAG_SERVICE_URL")
+          [[ -z "$CORS_ORIGINS" ]] && missing+=("var:CORS_ORIGINS")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required GitHub config: ${missing[*]}"
+            exit 1
+          fi
+
+      # Las migraciones corren antes del deploy: si fallan, la revision vieja sigue
+      # sirviendo trafico con un esquema que le sirve.
+      - name: Run database migrations
+        env:
+          DATABASE_URL: ${{ secrets.BACKEND_DATABASE_URL }}
+        run: |
+          pip install --quiet uv
+          cd backend
+          uv sync --frozen
+          uv run alembic upgrade head
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE }}
+          flags: >
+            --allow-unauthenticated
+            --port=8000
+            --cpu=1
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=10
+            --timeout=300
+            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
+          env_vars: |
+            DATABASE_URL=${{ secrets.BACKEND_DATABASE_URL }}
+            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}
+            INTERNAL_TOKEN=${{ secrets.INTERNAL_TOKEN }}
+            RAG_SERVICE_URL=${{ vars.RAG_SERVICE_URL }}
+            RAG_USE_ID_TOKEN=true
+            CORS_ORIGINS=${{ vars.CORS_ORIGINS }}
+            GEMINI_GUARDRAIL_MODEL=${{ vars.GEMINI_GUARDRAIL_MODEL || 'gemini-2.5-flash-lite' }}
+            GEMINI_REWRITE_MODEL=${{ vars.GEMINI_REWRITE_MODEL || 'gemini-2.5-flash' }}
+            GEMINI_ANSWER_MODEL=${{ vars.GEMINI_ANSWER_MODEL || 'gemini-2.5-pro' }}
+            GEMINI_TRANSCRIBE_MODEL=${{ vars.GEMINI_TRANSCRIBE_MODEL || 'gemini-2.5-flash' }}
+            RETRIEVAL_TOP_K=${{ vars.RETRIEVAL_TOP_K || '8' }}
+            RETRIEVAL_MAX_ATTEMPTS=${{ vars.RETRIEVAL_MAX_ATTEMPTS || '2' }}
+            SEMANTIC_WEIGHT=${{ vars.SEMANTIC_WEIGHT || '0.6' }}
+            LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}
+            DEBUG=${{ vars.DEBUG || 'false' }}
+            LANGSMITH_TRACING=${{ vars.LANGSMITH_TRACING || 'false' }}
+            LANGSMITH_API_KEY=${{ secrets.LANGSMITH_API_KEY }}
+            LANGSMITH_PROJECT=${{ vars.LANGSMITH_PROJECT || 'cartia-legal' }}
+
+      - name: Show deployed URL
+        run: |
+          echo "Backend URL: ${{ steps.deploy.outputs.url }}"

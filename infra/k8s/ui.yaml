@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  labels:
+    app: ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ui
+  template:
+    metadata:
+      labels:
+        app: ui
+    spec:
+      containers:
+        - name: ui
+          image: cartia-ui
+          ports:
+            - containerPort: 3000
+          env:
+            # El browser corre en el host, no en el cluster: la URL del backend tiene que
+            # ser la del port-forward de Tilt, no el nombre del Service.
+            - name: NEXT_PUBLIC_API_URL
+              value: http://localhost:8000
+            - name: NEXT_TELEMETRY_DISABLED
+              value: "1"
+            - name: WATCHPACK_POLLING
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+spec:
+  selector:
+    app: ui
+  ports:
+    - port: 3000
+      targetPort: 3000

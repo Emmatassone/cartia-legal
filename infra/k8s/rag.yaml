@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag
+  labels:
+    app: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag
+  template:
+    metadata:
+      labels:
+        app: rag
+    spec:
+      containers:
+        - name: rag
+          image: cartia-rag
+          # `--reload` es solo para el entorno local: Tilt sincroniza los archivos dentro
+          # del contenedor y uvicorn reinicia solo. En Cloud Run se usa el CMD del Dockerfile.
+          command:
+            ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+          ports:
+            - containerPort: 8002
+          envFrom:
+            - secretRef:
+                name: cartia-secrets
+          env:
+            - name: LOG_LEVEL
+              value: INFO
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag
+spec:
+  selector:
+    app: rag
+  ports:
+    - port: 8002
+      targetPort: 8002

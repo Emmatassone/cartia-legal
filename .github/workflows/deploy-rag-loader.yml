@@ -1,0 +1,114 @@
+# El rag-loader es on-demand: no se despliega como servicio sino como Cloud Run Job.
+#
+# El flujo habitual sigue siendo local (`uv run cartia-loader ingest ...`), porque los
+# documentos viven en la maquina del estudio. El Job existe para dos casos: ingestar desde
+# un bucket de GCS y poder disparar un reindex sin depender de una notebook.
+name: Deploy RAG Loader as Cloud Run Job
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rag-loader/**"
+      - "shared/**"
+      - ".github/workflows/deploy-rag-loader.yml"
+  workflow_dispatch:
+    inputs:
+      execute_after_deploy:
+        description: "Ejecutar el job después de desplegarlo"
+        type: boolean
+        default: false
+      reindex:
+        description: "Reindex completo (BORRA el índice) en lugar de ingesta incremental"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-rag-loader
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'southamerica-east1' }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY || 'cartia-containers' }}
+  JOB_NAME: ${{ vars.RAG_LOADER_JOB_NAME || 'cartia-rag-loader' }}
+  RUNTIME_SERVICE_ACCOUNT: ${{ vars.RAG_LOADER_RUNTIME_SERVICE_ACCOUNT }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push container
+        env:
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.JOB_NAME }}:${{ github.sha }}
+        run: |
+          docker build -f rag-loader/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Validate required secrets and vars
+        env:
+          RAG_DATABASE_URL: ${{ secrets.RAG_DATABASE_URL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS }}
+        run: |
+          missing=()
+          [[ -z "$RAG_DATABASE_URL" ]] && missing+=("secret:RAG_DATABASE_URL")
+          [[ -z "$GOOGLE_API_KEY" ]] && missing+=("secret:GOOGLE_API_KEY")
+          [[ -z "$EMBEDDING_DIMENSIONS" ]] && missing+=("var:EMBEDDING_DIMENSIONS")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required GitHub config: ${missing[*]}"
+            exit 1
+          fi
+
+      # `jobs deploy` crea el job si no existe y lo actualiza si ya estaba. El timeout es
+      # alto porque un reindex de un corpus grande son miles de llamadas de embeddings.
+      - name: Deploy Cloud Run Job
+        run: |
+          gcloud run jobs deploy "${{ env.JOB_NAME }}" \
+            --image="${{ env.IMAGE }}" \
+            --region="${{ env.REGION }}" \
+            --service-account="${{ env.RUNTIME_SERVICE_ACCOUNT }}" \
+            --cpu=2 \
+            --memory=4Gi \
+            --task-timeout=3600s \
+            --max-retries=1 \
+            --command=python \
+            --args=-m,app.cli,ingest,. \
+            --set-env-vars="^@^DATABASE_URL=${{ secrets.RAG_DATABASE_URL }}@GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}@INTERNAL_TOKEN=${{ secrets.INTERNAL_TOKEN }}@EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'gemini-embedding-001' }}@EMBEDDING_DIMENSIONS=${{ vars.EMBEDDING_DIMENSIONS }}@DOCUMENTS_DIR=${{ vars.LOADER_DOCUMENTS_DIR || '/app/documents' }}@MAX_CHUNK_CHARS=${{ vars.MAX_CHUNK_CHARS || '1800' }}@MIN_CHUNK_CHARS=${{ vars.MIN_CHUNK_CHARS || '250' }}@CHUNK_OVERLAP_CHARS=${{ vars.CHUNK_OVERLAP_CHARS || '200' }}@LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}" \
+            --quiet
+
+      - name: Execute job
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.execute_after_deploy }}
+        run: |
+          if [ "${{ inputs.reindex }}" = "true" ]; then
+            ARGS="-m,app.cli,reindex,--yes"
+          else
+            ARGS="-m,app.cli,ingest,."
+          fi
+          gcloud run jobs execute "${{ env.JOB_NAME }}" \
+            --region="${{ env.REGION }}" \
+            --args="$ARGS" \
+            --wait \
+            --quiet

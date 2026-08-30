@@ -1,0 +1,106 @@
+# La UI es el unico servicio que no va a Cloud Run: se despliega en Vercel.
+#
+# El proyecto de Vercel tiene que tener "Root Directory" = `ui`, para que `vercel build`
+# encuentre el `package.json` sin que haya que mover el CLI de directorio.
+name: Deploy UI to Vercel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ui/**"
+      - ".github/workflows/deploy-ui.yml"
+  pull_request:
+    paths:
+      - "ui/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: deploy-ui-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Validate required secrets and vars
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+        run: |
+          missing=()
+          [[ -z "$VERCEL_TOKEN" ]] && missing+=("secret:VERCEL_TOKEN")
+          [[ -z "$VERCEL_ORG_ID" ]] && missing+=("secret:VERCEL_ORG_ID")
+          [[ -z "$VERCEL_PROJECT_ID" ]] && missing+=("secret:VERCEL_PROJECT_ID")
+          [[ -z "$NEXT_PUBLIC_API_URL" ]] && missing+=("var:NEXT_PUBLIC_API_URL")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required GitHub config: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # En PR se despliega a Preview; en main, a Production.
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "environment=preview" >> "$GITHUB_OUTPUT"
+            echo "flags=" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "flags=--prod" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull Vercel environment
+        run: |
+          vercel pull --yes \
+            --environment=${{ steps.target.outputs.environment }} \
+            --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build
+        env:
+          # `NEXT_PUBLIC_*` se inlinea en el bundle, asi que tiene que estar en build time.
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+        run: vercel build ${{ steps.target.outputs.flags }} --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt ${{ steps.target.outputs.flags }} \
+            --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "UI URL: $url"
+
+      - name: Comment preview URL on the PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Preview de la UI: ${{ steps.deploy.outputs.url }}`,
+            });

@@ -1,0 +1,86 @@
+# Lint y tests en cada PR. Corre antes que cualquier workflow de deploy, para que un push
+# a main no pueda desplegar algo que no compila.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, rag, rag-loader]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ matrix.service }}/uv.lock"
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        working-directory: ${{ matrix.service }}
+        run: uv run ruff check .
+
+      - name: Pytest
+        working-directory: ${{ matrix.service }}
+        env:
+          # Valores dummy: los tests no tocan la red ni la base.
+          DATABASE_URL: postgresql+psycopg://cartia:cartia@localhost:5432/cartia
+          JWT_SECRET: ci-secret-de-al-menos-32-caracteres-012345
+          GOOGLE_API_KEY: ci-dummy-key
+        run: uv run pytest -q
+
+  ui:
+    name: UI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: ui
+        run: npm run typecheck
+
+      - name: Lint
+        working-directory: ui
+        run: npm run lint
+
+      - name: Build
+        working-directory: ui
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
