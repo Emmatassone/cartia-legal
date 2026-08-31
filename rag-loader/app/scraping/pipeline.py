@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import unicodedata
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,46 @@ def _tipo_normalizado(entry: CatalogEntry) -> str:
     return _normalize(entry.tipo_norma)
 
 
+def _nombre_archivo(entry: CatalogEntry) -> str:
+    """Nombre del .txt dentro de la carpeta de la materia.
+
+    Los numeros puramente digitales conservan el esquema original (compatibilidad con
+    lo ya descargado y su manifiesto). Numeros como "S/N" o "1234/95" se slugifican y
+    llevan el id de InfoLEG de sufijo: el crudo rompe el path ('/' es separador) y
+    hay muchas "Ley S/N" distintas que colisionarian entre si.
+    """
+    label = _TIPO_LABEL.get(_tipo_normalizado(entry), "norma")
+    numero = entry.numero_normalizado
+    if numero.isdigit():
+        base = f"{_slugify(label)}-{numero}"
+    else:
+        numero_slug = _slugify(numero)
+        sufijo = f"{numero_slug}-id{entry.id_norma}" if numero_slug else f"id{entry.id_norma}"
+        base = f"{_slugify(label)}-{sufijo}"
+    if entry.titulo_resumido:
+        base += f"-{_slugify(entry.titulo_resumido)}"
+    return base
+
+
+def _resolver_nombres(seleccion: list[tuple[CatalogEntry, Categoria]]) -> dict[int, str]:
+    """Nombre de archivo por id_norma, desambiguando colisiones.
+
+    El numero se repite entre anos (hay un "Decreto 7" por presidencia) y el slug no
+    incluye el ano, asi que normas distintas pueden mapear al mismo path. Cuando eso
+    pasa, TODAS las del grupo llevan el id de sufijo: si solo se renombrara la segunda,
+    el archivo ya escrito seguiria teniendo el encabezado de una norma y el texto de
+    otra.
+    """
+    conteo = Counter((categoria.value, _nombre_archivo(entry)) for entry, categoria in seleccion)
+    nombres: dict[int, str] = {}
+    for entry, categoria in seleccion:
+        nombre = _nombre_archivo(entry)
+        if conteo[(categoria.value, nombre)] > 1:
+            nombre = f"{nombre}-id{entry.id_norma}"
+        nombres[entry.id_norma] = nombre
+    return nombres
+
+
 def build_sidecar(entry: CatalogEntry, categoria: Categoria) -> dict[str, Any]:
     """Metadata en el formato exacto que espera `infer_metadata` (sidecar .meta.json)."""
     tipo = _tipo_normalizado(entry)
@@ -172,7 +213,11 @@ def select_entries(
     tipos: set[str] | None = None,
     anio_desde: int | None = None,
     solo_vigentes: bool = False,
+    incluir_ruido: bool = False,
 ) -> list[tuple[CatalogEntry, Categoria]]:
+    """Filtra el catalogo. El `ruido` (actos individuales: designaciones, homenajes,
+    decretos secretos de personal) se saltea salvo pedido expreso: ocupa un tercio
+    del catalogo y no aporta nada a un corpus de consulta juridica."""
     tipos = {_normalize(tipo) for tipo in (tipos or TIPOS_DEFAULT)}
     seleccion = []
     for entry in entries:
@@ -183,6 +228,10 @@ def select_entries(
         if solo_vigentes and entry.estado == NormaEstado.DEROGADA:
             continue
         categoria = classify(entry)
+        if categoria == Categoria.RUIDO and not (
+            incluir_ruido or (materias and "ruido" in materias)
+        ):
+            continue
         if materias and categoria.value not in materias:
             continue
         seleccion.append((entry, categoria))
@@ -198,6 +247,7 @@ def scrape(
     limit: int | None = None,
     anio_desde: int | None = None,
     solo_vigentes: bool = False,
+    incluir_ruido: bool = False,
     force: bool = False,
     dry_run: bool = False,
     catalog_path: Path | None = None,
@@ -226,6 +276,7 @@ def scrape(
         tipos=tipos,
         anio_desde=anio_desde,
         solo_vigentes=solo_vigentes,
+        incluir_ruido=incluir_ruido,
     )
     if limit:
         seleccion = seleccion[:limit]
@@ -239,15 +290,13 @@ def scrape(
 
     manifest_path = catalog_dir / "manifest.json"
     manifest = _load_manifest(manifest_path)
+    nombres = _resolver_nombres(seleccion)
 
     with NormaFetcher() as fetcher:
         for entry, categoria in seleccion:
             key = str(entry.id_norma)
             carpeta = documents_dir / categoria.value
-            slug = f"{_slugify(_TIPO_LABEL.get(_tipo_normalizado(entry), 'norma'))}-"
-            slug += entry.numero_normalizado or f"id{entry.id_norma}"
-            slug += f"-{_slugify(entry.titulo_resumido)}" if entry.titulo_resumido else ""
-            destino = carpeta / f"{slug}.txt"
+            destino = carpeta / f"{nombres[entry.id_norma]}.txt"
 
             previo = manifest.get(key)
             if previo and destino.exists() and not force:
@@ -259,22 +308,23 @@ def scrape(
                 result.errors.append(f"{key}: la entrada del catalogo no tiene URL de texto")
                 continue
 
+            # Una norma rota (HTTP, HTML sin texto, nombre de archivo invalido) no
+            # puede tirar una corrida de 12 horas: se anota y se sigue.
             try:
                 texto = fetcher.fetch_text(entry.best_url, force=force)
+                sidecar = build_sidecar(entry, categoria)
+                contenido = f"{_header_textual(entry, categoria, sidecar)}\n\n{texto}\n"
+
+                carpeta.mkdir(parents=True, exist_ok=True)
+                destino.write_text(contenido, encoding="utf-8")
+                destino.with_suffix(".txt.meta.json").write_text(
+                    json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
             except Exception as exc:
                 result.fallidas += 1
                 result.errors.append(f"{key} ({entry.best_url}): {exc}")
                 logger.warning("fallo la descarga de la norma %s: %s", key, exc)
                 continue
-
-            sidecar = build_sidecar(entry, categoria)
-            contenido = f"{_header_textual(entry, categoria, sidecar)}\n\n{texto}\n"
-
-            carpeta.mkdir(parents=True, exist_ok=True)
-            destino.write_text(contenido, encoding="utf-8")
-            destino.with_suffix(".txt.meta.json").write_text(
-                json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
 
             manifest[key] = {
                 "path": destino.relative_to(documents_dir).as_posix(),
@@ -284,6 +334,12 @@ def scrape(
                 "fetched_at": datetime.now(UTC).isoformat(),
             }
             result.descargadas += 1
+            # Checkpoint: en corridas de 12+ horas no se puede perder el manifiesto
+            # si el proceso muere a mitad de camino.
+            if result.descargadas % 500 == 0:
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
             report(f"[{categoria.value}] {sidecar['citation']}")
 
     # `_meta.json` por carpeta: refuerza el fuero aunque falte algun sidecar puntual.

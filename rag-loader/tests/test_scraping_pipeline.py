@@ -8,6 +8,8 @@ from app.scraping.catalog import CatalogEntry
 from app.scraping.classifier import Categoria
 from app.scraping.pipeline import (
     _format_numero,
+    _nombre_archivo,
+    _resolver_nombres,
     build_sidecar,
     select_entries,
 )
@@ -72,6 +74,45 @@ def test_format_numero() -> None:
     assert _format_numero("S/N") == "S/N"
 
 
+def test_el_nombre_de_archivo_conserva_el_esquema_para_numeros_digitales() -> None:
+    # Compatibilidad con lo ya descargado y su manifiesto.
+    assert _nombre_archivo(entry(1, numero="20744", titulo="Contrato de trabajo")) == (
+        "ley-20744-contrato-de-trabajo"
+    )
+
+
+def test_el_nombre_de_archivo_tolera_numeros_con_barra() -> None:
+    # "S/N" crudo rompe el path ('/' es separador de directorios en Windows).
+    nombre = _nombre_archivo(entry(183290, numero="S/N", titulo="Hacienda"))
+    assert "/" not in nombre and "\\" not in nombre
+    assert "id183290" in nombre  # el id desempata las muchas "Ley S/N" distintas
+
+
+def test_el_nombre_de_archivo_sin_numero_usa_el_id() -> None:
+    assert _nombre_archivo(entry(42, numero="", titulo="")).startswith("ley-id42")
+
+
+def test_las_colisiones_de_nombre_se_desambiguam_con_el_id() -> None:
+    # El numero se repite entre presidencias y el slug no incluye el ano.
+    colisiona_1 = entry(23651, tipo="Decreto", numero="7", titulo="Ministro - Designacion")
+    colisiona_2 = entry(61400, tipo="Decreto", numero="7", titulo="Ministro - Designacion")
+    sin_colision = entry(1, numero="20744", titulo="")
+
+    nombres = _resolver_nombres(
+        [
+            (colisiona_1, Categoria.ADMINISTRATIVO),
+            (colisiona_2, Categoria.ADMINISTRATIVO),
+            (sin_colision, Categoria.LABORAL),
+        ]
+    )
+
+    assert nombres[23651] != nombres[61400]
+    assert "id23651" in nombres[23651]
+    assert "id61400" in nombres[61400]
+    # La que no colisiona conserva el esquema original (compatibilidad con el manifiesto).
+    assert nombres[1] == "ley-20744"
+
+
 def test_select_entries_filtra_por_tipo_materia_anio_y_estado() -> None:
     entradas = [
         entry(1, numero="20744", titulo=""),  # laboral, vigente
@@ -101,3 +142,21 @@ def test_select_entries_es_determinista() -> None:
     seleccion = select_entries(entradas)
 
     assert [e.id_norma for e, _ in seleccion] == [1, 2, 3]
+
+
+def test_select_entries_saltea_el_ruido_por_default() -> None:
+    entradas = [
+        entry(1, numero="20744", titulo=""),  # laboral
+        entry(2, tipo="Decreto", titulo="DESIGNACION - PRORROGA"),  # ruido
+        entry(3, tipo="Decreto", titulo="", observaciones=None),  # otros
+    ]
+
+    seleccion = select_entries(entradas)
+    assert [e.id_norma for e, _ in seleccion] == [1, 3]
+
+    con_ruido = select_entries(entradas, incluir_ruido=True)
+    assert [e.id_norma for e, _ in con_ruido] == [1, 2, 3]
+
+    # Pedir la materia explicitamente tambien la habilita.
+    solo_ruido = select_entries(entradas, materias={"ruido"})
+    assert [e.id_norma for e, _ in solo_ruido] == [2]

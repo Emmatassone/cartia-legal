@@ -268,6 +268,9 @@ def scrape_list(
     incluir_derogadas: Annotated[
         bool, typer.Option(help="Incluir normas derogadas en la seleccion")
     ] = False,
+    incluir_ruido: Annotated[
+        bool, typer.Option(help="Incluir actos individuales (designaciones, homenajes, etc.)")
+    ] = False,
 ) -> None:
     """Preview: cuantas normas caerian en cada carpeta, sin descargar nada."""
     _configure_logging()
@@ -283,7 +286,12 @@ def scrape_list(
         tipos={t.strip() for t in tipos.split(",")} if tipos else None,
         anio_desde=anio_desde,
         solo_vigentes=not incluir_derogadas,
+        incluir_ruido=True,
     )
+    ruido = sum(1 for _, categoria in seleccion if categoria.value == "ruido")
+    if not incluir_ruido:
+        seleccion = [(e, c) for e, c in seleccion if c.value != "ruido"]
+
     table = Table(title=f"{len(seleccion)} normas seleccionadas")
     table.add_column("Carpeta")
     table.add_column("Normas", justify="right")
@@ -293,6 +301,11 @@ def scrape_list(
     for categoria, cantidad in sorted(counts.items(), key=lambda item: -item[1]):
         table.add_row(categoria, str(cantidad))
     console.print(table)
+    if ruido and not incluir_ruido:
+        console.print(
+            f"[dim]{ruido} actos individuales (designaciones, homenajes, decretos "
+            f"secretos de personal, etc.) quedan fuera; --incluir-ruido los suma[/]"
+        )
 
 
 @app.command()
@@ -310,6 +323,9 @@ def scrape(
     ] = None,
     incluir_derogadas: Annotated[
         bool, typer.Option(help="Tambien descargar normas derogadas (quedan marcadas)")
+    ] = False,
+    incluir_ruido: Annotated[
+        bool, typer.Option(help="Tambien descargar actos individuales (designaciones, etc.)")
     ] = False,
     force: Annotated[
         bool, typer.Option(help="Re-descargar aunque ya esten en el manifiesto")
@@ -329,6 +345,7 @@ def scrape(
         limit=limit,
         anio_desde=anio_desde,
         solo_vigentes=not incluir_derogadas,
+        incluir_ruido=incluir_ruido,
         force=force,
         dry_run=dry_run,
         on_progress=lambda message: console.print(f"  {message}"),

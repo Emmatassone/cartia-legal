@@ -3,8 +3,15 @@
 Precedencia:
   1. mapa curado de normas conocidas (LCT, CCCyC, codigos procesales, etc.): las
      normas mas consultadas no pueden depender de que un keyword aparezca en el titulo.
-  2. reglas por keywords sobre titulo_resumido + titulo_sumario + organismo.
-  3. `otros`: queda en su propia carpeta para revision, nunca se descarta.
+  2. `ruido`: actos administrativos individuales (designaciones, condecoraciones,
+     decretos secretos de personal, promulgaciones). No aportan a un RAG juridico y
+     el pipeline los saltea por default (`--incluir-ruido` los recupera).
+  3. reglas por keywords sobre titulo_resumido + titulo_sumario + organismo.
+  4. mapa del titulo_sumario: el topico generico que InfoLEG asigna a mano; es mas
+     grosero que el titulo (dice el ministerio, no la materia), por eso va despues.
+  5. reglas por keywords sobre texto_resumido (la bajada descriptiva del catalogo;
+     salva normas historicas con titulos cripticos tipo "ESTABLECENSE").
+  6. `otros`: queda en su propia carpeta para revision, nunca se descarta.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ class Categoria(StrEnum):
     MIGRATORIO = "migratorio"
     DATOS_PERSONALES = "datos-personales"
     PROPIEDAD_INTELECTUAL = "propiedad-intelectual"
+    INTERNACIONAL = "internacional"
+    RUIDO = "ruido"
     OTROS = "otros"
 
 
@@ -59,6 +68,8 @@ CATEGORIA_FUERO: dict[Categoria, Fuero] = {
     Categoria.MIGRATORIO: Fuero.MIGRATORIO,
     Categoria.DATOS_PERSONALES: Fuero.DATOS_PERSONALES,
     Categoria.PROPIEDAD_INTELECTUAL: Fuero.PROPIEDAD_INTELECTUAL,
+    Categoria.INTERNACIONAL: Fuero.INTERNACIONAL,
+    Categoria.RUIDO: Fuero.OTRO,
     Categoria.OTROS: Fuero.OTRO,
 }
 
@@ -103,6 +114,56 @@ _NORMAS_CONOCIDAS: dict[tuple[str, str], Categoria] = {
     ("ley", "26061"): Categoria.FAMILIA,  # Proteccion integral NNyA
 }
 
+# Sumarios (topico generico curado por InfoLEG) que son actos individuales sin valor
+# para un corpus de consulta: personal, protocolo y beneficios a particulares.
+# Van normalizados (sin acentos, minuscula) y se comparan por igualdad.
+_SUMARIOS_RUIDO = {
+    "decretos secretos y reservados",
+    "condecoraciones",
+    "homenajes",
+    "huespedes oficiales",
+    "subsidio estatal",
+    "ferias internacionales",
+    "exencion de gravamenes",
+}
+
+# Titulos que delatan un acto individual aunque el sumario venga vacio. Se buscan
+# al inicio del titulo normalizado: son formulas fijas del Boletin Oficial.
+_REGEX_RUIDO_TITULO = re.compile(
+    r"^(designacion|promociones?|cesantia|nombramiento|renuncia|becas?|subsidio|"
+    r"indulto|conmutacion|naturalizacion|homenaje|condecoracion|huesped|"
+    r"salida del pais|pension graciable|ley n.{0,12}su promulgacion)\b"
+)
+
+# InfoLEG marca las normas agotadas en la bajada ("OBJETO CUMPLIDO-..."): cumplieron
+# su finalidad sin ser derogadas, asi que el filtro de vigentes no las alcanza.
+_REGEX_RUIDO_RESUMEN = re.compile(r"^(objeto cumplido|ambito temporal cumplido)\b")
+
+# Mapa del titulo_sumario a materia. Se aplica DESPUES de las reglas por keywords:
+# el sumario suele nombrar el organismo ("MINISTERIO DE ECONOMIA"), no la materia,
+# asi que solo decide cuando el titulo no dijo nada util.
+_REGLAS_SUMARIO: list[tuple[Categoria, str]] = [
+    (
+        Categoria.INTERNACIONAL,
+        r"tratados internacionales|^acuerdos$|^convenios$|servicio exterior|relaciones exteriores",
+    ),
+    (Categoria.LABORAL, r"trabajo|empleo"),
+    (Categoria.PREVISIONAL, r"seguridad social|beneficios previsionales"),
+    (Categoria.TRIBUTARIO, r"fisco|impuestos|aduana"),
+    (Categoria.PROCESAL, r"^justicia$|ministerio publico|poder judicial|magistratura"),
+    (Categoria.MIGRATORIO, r"migraciones"),
+    (Categoria.SALUD, r"salud"),
+    (Categoria.AMBIENTAL, r"ambiente|recursos naturales"),
+    (
+        Categoria.ADMINISTRATIVO,
+        r"ministerio|jefatura de gabinete|presidencia|poder ejecutivo|estado nacional|"
+        r"administracion publica|secretaria|personal militar|policia|banco central|"
+        r"bienes del estado|inmuebles|contratos|presupuesto|servicios publicos|"
+        r"transporte|hidrocarburos|radiodifusion|procedimientos administrativos|"
+        r"educacion|defensa|seguridad|interior|agricultura|cultura|planificacion",
+    ),
+]
+
 # Orden importa: la primera regla que matchea gana. Las materias mas especificas van
 # antes que las generales (consumo antes que civil, procesal antes que administrativo).
 _REGLAS: list[tuple[Categoria, str]] = [
@@ -124,6 +185,8 @@ _REGLAS: list[tuple[Categoria, str]] = [
     (Categoria.SOCIETARIO, r"sociedad|societari|\bs\.?a\.?\b|\bsrl\b|\bsas\b"),
     (Categoria.COMERCIAL, r"comercial|concurso|quiebra|cheque|fideicomiso|mercado de capitales"),
     (Categoria.CONSTITUCIONAL, r"constitucional|amparo|habeas corpus|derechos humanos"),
+    # "convenio" solo no alcanza: los convenios colectivos son laborales.
+    (Categoria.INTERNACIONAL, r"tratado|acuerdo internacional|convenio internacional"),
     (Categoria.ADMINISTRATIVO, r"administrativ|funcion publica|contrataciones|expropiaci"),
     (Categoria.CIVIL_COMERCIAL, r"civil|comercial|codigo civil|obligaciones|contratos"),
 ]
@@ -137,25 +200,48 @@ def _normalize(value: str) -> str:
     )
 
 
+def _match_reglas(texto: str, reglas: list[tuple[Categoria, str]]) -> Categoria | None:
+    for categoria, pattern in reglas:
+        if re.search(pattern, texto):
+            return categoria
+    return None
+
+
 def classify(entry: CatalogEntry) -> Categoria:
     tipo = _normalize(entry.tipo_norma)
     numero = entry.numero_normalizado
     if numero and (tipo, numero) in _NORMAS_CONOCIDAS:
         return _NORMAS_CONOCIDAS[(tipo, numero)]
 
-    haystack = _normalize(
-        " ".join(
-            part
-            for part in [
-                entry.titulo_resumido,
-                entry.titulo_sumario or "",
-                entry.organismo_origen or "",
-                entry.clase_norma or "",
-            ]
-            if part
-        )
+    titulo = _normalize(entry.titulo_resumido)
+    sumario = _normalize(entry.titulo_sumario or "").strip()
+
+    if (
+        sumario in _SUMARIOS_RUIDO
+        or _REGEX_RUIDO_TITULO.search(titulo)
+        or (entry.texto_resumido and _REGEX_RUIDO_RESUMEN.search(_normalize(entry.texto_resumido)))
+    ):
+        return Categoria.RUIDO
+
+    haystack = " ".join(
+        part
+        for part in [
+            titulo,
+            sumario,
+            _normalize(entry.organismo_origen or ""),
+            _normalize(entry.clase_norma or ""),
+        ]
+        if part
     )
-    for categoria, pattern in _REGLAS:
-        if re.search(pattern, haystack):
-            return categoria
+    if categoria := _match_reglas(haystack, _REGLAS):
+        return categoria
+
+    if sumario and (categoria := _match_reglas(sumario, _REGLAS_SUMARIO)):
+        return categoria
+
+    if entry.texto_resumido and (
+        categoria := _match_reglas(_normalize(entry.texto_resumido), _REGLAS)
+    ):
+        return categoria
+
     return Categoria.OTROS

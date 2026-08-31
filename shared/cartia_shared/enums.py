@@ -69,6 +69,7 @@ class Fuero(StrEnum):
     PROPIEDAD_INTELECTUAL = "propiedad_intelectual"
     DATOS_PERSONALES = "datos_personales"
     PROCESAL = "procesal"
+    INTERNACIONAL = "internacional"
     OTRO = "otro"
 
 

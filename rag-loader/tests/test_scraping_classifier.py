@@ -69,3 +69,75 @@ def test_toda_categoria_tiene_fuero_asignado() -> None:
     assert set(CATEGORIA_FUERO) == set(Categoria)
     assert CATEGORIA_FUERO[Categoria.PROCESAL] == Fuero.PROCESAL
     assert CATEGORIA_FUERO[Categoria.LABORAL] == Fuero.LABORAL
+    assert CATEGORIA_FUERO[Categoria.INTERNACIONAL] == Fuero.INTERNACIONAL
+
+
+@pytest.mark.parametrize(
+    ("titulo", "sumario"),
+    [
+        ("", "DECRETOS SECRETOS Y RESERVADOS"),
+        ("", "HOMENAJES"),
+        ("", "CONDECORACIONES"),
+        ("", "HUESPEDES OFICIALES"),
+        ("", "SUBSIDIO ESTATAL"),
+        ("DESIGNACION - PRORROGA", ""),
+        ("PROMOCIONES", ""),
+        ("CESANTIA", ""),
+        ("BECAS - OTORGANSE", ""),
+        ("SALIDA DEL PAIS - AUTORIZASE", ""),
+        ("LEY Nº 22.248 - SU PROMULGACION", ""),
+    ],
+)
+def test_los_actos_individuales_son_ruido(titulo: str, sumario: str) -> None:
+    kwargs = {"titulo_sumario": sumario} if sumario else {}
+    assert classify(entry(titulo=titulo, **kwargs)) == Categoria.RUIDO
+
+
+def test_el_sumario_curado_clasifica_cuando_el_titulo_no_dice_nada() -> None:
+    assert classify(entry(titulo="", titulo_sumario="SEGURIDAD SOCIAL")) == Categoria.PREVISIONAL
+    assert classify(entry(titulo="", titulo_sumario="JUSTICIA")) == Categoria.PROCESAL
+    assert classify(entry(titulo="", titulo_sumario="FISCO NACIONAL")) == Categoria.TRIBUTARIO
+    assert classify(entry(titulo="", titulo_sumario="TRATADOS INTERNACIONALES")) == (
+        Categoria.INTERNACIONAL
+    )
+    assert classify(entry(titulo="", titulo_sumario="MINISTERIO DE DEFENSA")) == (
+        Categoria.ADMINISTRATIVO
+    )
+
+
+def test_el_titulo_especifico_gana_sobre_el_sumario_generico() -> None:
+    # El sumario dice el ministerio de origen; el titulo dice la materia.
+    assert (
+        classify(entry(titulo="Impuesto a las ganancias", titulo_sumario="MINISTERIO DE SALUD"))
+        == Categoria.TRIBUTARIO
+    )
+
+
+def test_el_texto_resumido_salva_titulos_cripticos() -> None:
+    assert (
+        classify(
+            entry(
+                titulo="ESTABLECENSE",
+                texto_resumido="ESTABLECESE UN REGIMEN DE JUBILACIONES Y PENSIONES.",
+            )
+        )
+        == Categoria.PREVISIONAL
+    )
+
+
+def test_los_tratados_son_internacional() -> None:
+    assert classify(entry(titulo="Tratado de libre comercio")) == Categoria.INTERNACIONAL
+
+
+def test_las_normas_agotadas_son_ruido() -> None:
+    # InfoLEG las marca en la bajada; el filtro de vigentes no las alcanza porque
+    # nunca fueron derogadas formalmente.
+    assert (
+        classify(
+            entry(
+                titulo="",
+                texto_resumido="OBJETO CUMPLIDO-DECLARA EXTRAORDINARIAS LAS SESIONES DE 1854",
+            )
+        )
+        == Categoria.RUIDO
+    )
