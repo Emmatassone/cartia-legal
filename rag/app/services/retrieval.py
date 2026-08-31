@@ -155,9 +155,11 @@ async def hybrid_search(session: AsyncSession, request: SearchRequest) -> Search
 
     # `ef_search` controla el trade-off recall/latencia del HNSW. Se sube por encima del
     # default (40) porque el pool de candidatos se recorta despues con RRF.
+    # SET no admite bind params en Postgres; set_config(..., is_local=true) equivale a
+    # SET LOCAL dentro de la transaccion.
     await session.execute(
-        text("SET LOCAL hnsw.ef_search = :ef"),
-        {"ef": max(64, settings.candidate_pool * 2)},
+        text("SELECT set_config('hnsw.ef_search', :ef, true)"),
+        {"ef": str(max(64, settings.candidate_pool * 2))},
     )
     rows = (await session.execute(text(sql), params)).mappings().all()
 

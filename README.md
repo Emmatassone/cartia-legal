@@ -28,7 +28,7 @@ dimensionalidad y nombres de tabla: si divergen, el retrieval se degrada en sile
                                                                        │ SQL
                                         ┌──────────────┐               ▼
                                         │  rag-loader  │ ───────► Postgres + pgvector
-                                        │  (on-demand) │           (Cloud SQL / Neon)
+                                        │  (on-demand) │           (Neon)
                                         └──────────────┘
 ```
 
@@ -122,25 +122,27 @@ entre la LCT y el CCyC.
 - [Tilt](https://docs.tilt.dev/install.html) y `kubectl`
 - [uv](https://docs.astral.sh/uv/) y Node 22+
 - Una API key de [Google AI Studio](https://aistudio.google.com/apikey)
+- Una base Postgres con `pgvector` (p.ej. [Neon](https://neon.tech), gratis y escala a cero)
 
 ### Levantar el entorno
 
 ```bash
 cp .env.example .env
-# Completar GOOGLE_API_KEY en .env
+# Completar GOOGLE_API_KEY y DATABASE_URL en .env
 
 tilt up
 ```
 
-Tilt levanta Postgres con pgvector, el servicio RAG, el backend y la UI en el cluster, y
-corre las migraciones de Alembic y la creación del esquema del índice como tareas locales.
+Tilt levanta el servicio RAG, el backend y la UI en el cluster, y corre las migraciones
+de Alembic y la creación del esquema del índice como tareas locales. La base de datos es
+externa (Neon): se configura con `DATABASE_URL` en el `.env` y no hay Postgres local.
 
 | Servicio | URL                            |
 | -------- | ------------------------------ |
 | UI       | http://localhost:3000          |
 | Backend  | http://localhost:8000/docs     |
 | RAG      | http://localhost:8002/docs     |
-| Postgres | localhost:5432 (`cartia`)      |
+| Postgres | externo (Neon, vía `DATABASE_URL`) |
 
 **El rag-loader corre como proceso local, no en el cluster.** Los documentos a ingestar
 viven en el disco del estudio, y montar un directorio del host dentro del cluster es
@@ -160,10 +162,15 @@ deja clasificadas por materia, listas para ingestar:
    organismo, fechas de sanción y Boletín Oficial, observaciones y la URL directa al
    texto vigente.
 2. **Clasificación**: cada norma cae en una carpeta por materia (`laboral/`,
-   `civil-comercial/`, `consumo/`, `procesal/`, `penal/`, `tributario/`, etc.) con un
-   mapa curado para las normas más consultadas (LCT, CCCyC, CPCCN, LGS...) y reglas por
-   keywords para el resto. Lo que no clasifica va a `otros/` para revisión, nunca se
-   descarta.
+   `civil-comercial/`, `consumo/`, `procesal/`, `penal/`, `tributario/`,
+   `internacional/`, etc.). Precedencia: mapa curado de normas conocidas (LCT, CCCyC,
+   CPCCN, LGS...) → detección de ruido → keywords sobre título/sumario/organismo →
+   mapa del `titulo_sumario` (tópico curado por InfoLEG) → keywords sobre el
+   `texto_resumido` (la bajada descriptiva del catálogo) → `otros/` para revisión,
+   nunca se descarta. El **ruido** (designaciones, homenajes, condecoraciones,
+   decretos secretos de personal, normas con "objeto cumplido", promulgaciones) se
+   saltea por default: es ~28% del catálogo y no aporta a un corpus de consulta;
+   `--incluir-ruido` lo recupera.
 3. **Descarga**: el texto vigente se baja de InfoLEG con delay entre requests, User-Agent
    identificable y cache en disco. Se guarda como `.txt` limpio más un sidecar
    `.meta.json` con toda la metadata oficial, incluido el **estado de vigencia**
@@ -184,6 +191,7 @@ uv run cartia-loader scrape-list --materia laboral --materia consumo
 uv run cartia-loader scrape --materia laboral --materia civil-comercial --limit 100
 uv run cartia-loader scrape --anio-desde 2000            # todo, desde 2000
 uv run cartia-loader scrape --incluir-derogadas          # también las derogadas
+uv run cartia-loader scrape --incluir-ruido              # también actos individuales
 
 # 4. Ingestar lo descargado
 uv run cartia-loader ingest .
@@ -194,6 +202,15 @@ registra qué se bajó, y `--force` fuerza la re-descarga. Las normas derogadas 
 marcadas con `estado` y el backend las excluye del retrieval por defecto
 (`RETRIEVAL_EXCLUIR_DEROGADAS=false` para cambiarlo); en la UI las citas muestran un
 badge de vigencia.
+
+**Cobertura**: el catálogo tiene ~427.000 normas, pero InfoLEG solo digitalizó el
+texto de ~192.000. El resto no existe en formato digital en InfoLEG (la ficha
+`verNorma.do` tampoco tiene texto): son casi todas resoluciones/disposiciones
+internas, actos individuales y normas históricas pre-1990. Todas las leyes desde 2015
+tienen texto. Si alguna norma puntual falta y hace falta, el catálogo trae
+`numero_boletin` + `fecha_boletin` (97% de las faltantes), que permite buscarla en el
+archivo de ediciones del [Boletín Oficial](https://www.boletinoficial.gob.ar) y
+cargarla a mano como documento propio.
 
 #### Documentos propios
 
@@ -284,7 +301,7 @@ account en ningún momento.** Al final imprime los valores exactos a cargar en G
 
 ### Base de datos
 
-Cloud SQL para Postgres (o Neon) con la extensión `vector`. Un solo Postgres sirve a los
+Neon (Postgres serverless) con la extensión `vector`. Un solo Postgres sirve a los
 dos esquemas: las tablas de la aplicación (`users`, `conversations`, `messages`) las
 maneja Alembic desde el backend, y las del índice (`rag_documents`, `rag_chunks`) las crea
 el rag-loader con `cartia-loader init-schema`.

@@ -37,7 +37,6 @@ gcloud services enable \
   sts.googleapis.com \
   secretmanager.googleapis.com \
   generativelanguage.googleapis.com \
-  sqladmin.googleapis.com \
   --project="$PROJECT_ID"
 
 echo "==> Artifact Registry"

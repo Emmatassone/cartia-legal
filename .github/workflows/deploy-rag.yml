@@ -72,7 +72,8 @@ jobs:
 
       # `--no-allow-unauthenticated`: el servicio RAG solo lo consume el backend, nunca el
       # browser. Ademas valida el header X-Internal-Token, asi que hay dos capas.
-      # `--min-instances=1` evita el cold start en el hot path de cada consulta.
+      # `--min-instances=0` evita costo de compute cuando no hay tráfico. La primera
+      # consulta después de un rato sin uso paga un cold start de unos segundos.
       - name: Deploy to Cloud Run
         id: deploy
         uses: google-github-actions/deploy-cloudrun@v2
@@ -85,7 +86,7 @@ jobs:
             --port=8002
             --cpu=1
             --memory=1Gi
-            --min-instances=1
+            --min-instances=0
             --max-instances=10
             --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
           env_vars: |

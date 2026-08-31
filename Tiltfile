@@ -2,13 +2,14 @@
 #
 # Entorno local completo de CartIA Legal sobre Kubernetes.
 #
-#   En el cluster:  postgres (pgvector) · rag · backend · ui
+#   En el cluster:  rag · backend · ui
 #   Como proceso local: rag-loader
+#   Base de datos:  externa (Neon), via DATABASE_URL del .env — no hay Postgres local.
 #
 # El rag-loader corre fuera del cluster a proposito: los documentos a ingestar viven en el
 # disco del abogado, y montar un directorio del host dentro del cluster es fragil (sobre
-# todo en Windows). Como proceso local lee `rag-loader/documents/` directo y escribe en
-# Postgres por el port-forward, que es exactamente como va a correr en produccion.
+# todo en Windows). Como proceso local lee `rag-loader/documents/` directo y escribe en la
+# base externa por DATABASE_URL, que es exactamente como va a correr en produccion.
 #
 # Recursos manuales (se disparan con el boton de Tilt, no corren solos):
 #   rag-loader:ingest   -> ingesta incremental de DOCUMENTS_DIR
@@ -48,15 +49,13 @@ def required(key):
     return value
 
 GOOGLE_API_KEY = required("GOOGLE_API_KEY")
-POSTGRES_PASSWORD = env.get("POSTGRES_PASSWORD", "cartia-local")
 JWT_SECRET = env.get("JWT_SECRET", "jwt-secret-solo-para-desarrollo-local-0123456789")
 INTERNAL_TOKEN = env.get("INTERNAL_TOKEN", "token-interno-local")
 EMBEDDING_DIMENSIONS = env.get("EMBEDDING_DIMENSIONS", "1536")
 
-# Los servicios del cluster resuelven Postgres por el nombre del Service; los procesos
-# locales, por el port-forward.
-DB_URL_CLUSTER = "postgresql+psycopg://cartia:{}@postgres:5432/cartia".format(POSTGRES_PASSWORD)
-DB_URL_LOCAL = "postgresql+psycopg://cartia:{}@localhost:5432/cartia".format(POSTGRES_PASSWORD)
+# La base es externa (Neon) tanto para los servicios del cluster como para los procesos
+# locales: no hay Postgres local.
+DATABASE_URL = required("DATABASE_URL")
 
 # --------------------------------------------------------------------- secret compartido
 
@@ -68,8 +67,7 @@ k8s_yaml(
             "metadata": {"name": "cartia-secrets"},
             "type": "Opaque",
             "stringData": {
-                "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
-                "DATABASE_URL": DB_URL_CLUSTER,
+                "DATABASE_URL": DATABASE_URL,
                 "GOOGLE_API_KEY": GOOGLE_API_KEY,
                 "JWT_SECRET": JWT_SECRET,
                 "INTERNAL_TOKEN": INTERNAL_TOKEN,
@@ -84,15 +82,6 @@ k8s_yaml(
 k8s_resource(
     new_name="secrets",
     objects=["cartia-secrets:secret"],
-    labels=["infra"],
-)
-
-# --------------------------------------------------------------------- postgres
-
-k8s_yaml("infra/k8s/postgres.yaml")
-k8s_resource(
-    "postgres",
-    port_forwards=["5432:5432"],
     labels=["infra"],
 )
 
@@ -113,7 +102,6 @@ k8s_yaml("infra/k8s/rag.yaml")
 k8s_resource(
     "rag",
     port_forwards=["8002:8002"],
-    resource_deps=["postgres"],
     labels=["servicios"],
 )
 
@@ -134,7 +122,7 @@ k8s_yaml("infra/k8s/backend.yaml")
 k8s_resource(
     "backend",
     port_forwards=["8000:8000"],
-    resource_deps=["postgres", "rag"],
+    resource_deps=["rag"],
     labels=["servicios"],
 )
 
@@ -171,13 +159,12 @@ UV = "uv run --directory {}"
 local_resource(
     "backend:migrate",
     cmd="{} alembic upgrade head".format(UV.format("backend")),
-    env={"DATABASE_URL": DB_URL_LOCAL},
-    resource_deps=["postgres"],
+    env={"DATABASE_URL": DATABASE_URL},
     labels=["tareas"],
 )
 
 LOADER_ENV = {
-    "DATABASE_URL": DB_URL_LOCAL,
+    "DATABASE_URL": DATABASE_URL,
     "GOOGLE_API_KEY": GOOGLE_API_KEY,
     "INTERNAL_TOKEN": INTERNAL_TOKEN,
     "EMBEDDING_DIMENSIONS": EMBEDDING_DIMENSIONS,
@@ -188,7 +175,6 @@ local_resource(
     "rag-loader:init-schema",
     cmd="{} cartia-loader init-schema".format(UV.format("rag-loader")),
     env=LOADER_ENV,
-    resource_deps=["postgres"],
     labels=["tareas"],
 )
 
@@ -208,7 +194,6 @@ local_resource(
     "rag-loader:reindex",
     cmd="{} cartia-loader reindex --yes".format(UV.format("rag-loader")),
     env=LOADER_ENV,
-    resource_deps=["postgres"],
     trigger_mode=TRIGGER_MODE_MANUAL,
     auto_init=False,
     labels=["tareas"],
@@ -251,7 +236,7 @@ CartIA Legal levantado.
   UI          http://localhost:3000
   Backend     http://localhost:8000/docs
   RAG         http://localhost:8002/docs
-  Postgres    localhost:5432 (cartia/cartia)
+  Postgres    externo (DATABASE_URL del .env)
 
 Para cargar documentos: ponelos en rag-loader/documents/ y disparen el recurso
 `rag-loader:ingest` desde la UI de Tilt (o `tilt trigger rag-loader:ingest`).
